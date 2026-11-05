@@ -1,0 +1,217 @@
+"""
+Projectile simulator (prototype)
+================================
+Sliders for launch angle, launch speed and launch height, with a live readout
+of range, maximum height and flight time. Press "Launch" to animate the shot.
+
+Run:   python projectile_simulator.py
+Needs: matplotlib, numpy
+
+The physics lives in the plain functions at the top (no drawing code), so it can
+be reused later in a pygame / browser version or in the combined simulation.
+
+Model: constant gravity, no air resistance, flat ground at y = 0.
+    x(t) = v0 * cos(theta) * t
+    y(t) = y0 + v0 * sin(theta) * t - 1/2 * g * t^2
+"""
+
+import math
+
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.animation import FuncAnimation
+from matplotlib.widgets import Button, Slider
+
+G = 9.8  # m/s^2
+
+
+# --------------------------------------------------------------------------- #
+# Physics (no drawing code here)
+# --------------------------------------------------------------------------- #
+def components(speed, angle_deg):
+    """Return (vx, vy) in m/s for a launch speed and angle in degrees."""
+    a = math.radians(angle_deg)
+    return speed * math.cos(a), speed * math.sin(a)
+
+
+def flight_time(speed, angle_deg, height, g=G):
+    """Time until the projectile reaches the ground (y = 0)."""
+    _, vy = components(speed, angle_deg)
+    return (vy + math.sqrt(vy**2 + 2 * g * height)) / g
+
+
+def projectile_range(speed, angle_deg, height, g=G):
+    """Horizontal distance travelled until landing."""
+    vx, _ = components(speed, angle_deg)
+    return vx * flight_time(speed, angle_deg, height, g)
+
+
+def max_height(speed, angle_deg, height, g=G):
+    """Highest point above the ground. If launched downward, it is the launch height."""
+    _, vy = components(speed, angle_deg)
+    if vy <= 0:
+        return height
+    return height + vy**2 / (2 * g)
+
+
+def apex_x(speed, angle_deg, g=G):
+    """Horizontal position of the highest point."""
+    vx, vy = components(speed, angle_deg)
+    return vx * vy / g if vy > 0 else 0.0
+
+
+def position(t, speed, angle_deg, height, g=G):
+    """Return (x, y) at time t. Works with floats or numpy arrays."""
+    vx, vy = components(speed, angle_deg)
+    return vx * t, height + vy * t - 0.5 * g * t**2
+
+
+# --------------------------------------------------------------------------- #
+# Interface
+# --------------------------------------------------------------------------- #
+DEFAULTS = {"angle": 45.0, "speed": 20.0, "height": 0.0}
+FRAME_MS = 20  # animation step, real time (simulation runs at real speed)
+
+
+class Simulator:
+    def __init__(self):
+        self.fig, self.ax = plt.subplots(figsize=(10, 6.5))
+        self.fig.canvas.manager.set_window_title("Projectile simulator")
+        self.fig.subplots_adjust(left=0.08, right=0.97, top=0.93, bottom=0.30)
+
+        self.t = 0.0
+        self.running = False
+
+        self._build_axes()
+        self._build_controls()
+        self._refresh()
+
+        self.anim = FuncAnimation(
+            self.fig, self._tick, interval=FRAME_MS, cache_frame_data=False
+        )
+
+    # ---- construction ---------------------------------------------------- #
+    def _build_axes(self):
+        ax = self.ax
+        ax.set_xlabel("x (m)")
+        ax.set_ylabel("y (m)")
+        ax.set_title("Projectile motion (no air resistance)")
+        ax.grid(alpha=0.3)
+
+        (self.path_line,) = ax.plot([], [], "--", color="0.6", lw=1.2, label="predicted path")
+        (self.trail_line,) = ax.plot([], [], "-", color="tab:blue", lw=2.2)
+        (self.ball,) = ax.plot([], [], "o", color="tab:red", ms=11, zorder=5)
+        (self.apex_marker,) = ax.plot([], [], "^", color="tab:green", ms=9, label="highest point")
+        (self.land_marker,) = ax.plot([], [], "s", color="tab:orange", ms=8, label="landing")
+        self.ground = None
+        ax.legend(loc="upper right", fontsize=9)
+
+        self.readout = ax.text(
+            0.02, 0.97, "", transform=ax.transAxes, va="top", ha="left",
+            family="monospace", fontsize=10,
+            bbox=dict(boxstyle="round", facecolor="white", edgecolor="0.7", alpha=0.9),
+        )
+
+    def _build_controls(self):
+        def slider(y, label, lo, hi, init, step, fmt):
+            ax = self.fig.add_axes([0.15, y, 0.55, 0.03])
+            return Slider(ax, label, lo, hi, valinit=init, valstep=step, valfmt=fmt)
+
+        self.s_angle = slider(0.19, "Angle (°)", 0, 90, DEFAULTS["angle"], 1, "%d")
+        self.s_speed = slider(0.13, "Speed (m/s)", 1, 50, DEFAULTS["speed"], 0.5, "%.1f")
+        self.s_height = slider(0.07, "Height (m)", 0, 50, DEFAULTS["height"], 0.5, "%.1f")
+        for s in (self.s_angle, self.s_speed, self.s_height):
+            s.on_changed(self._on_slider)
+
+        self.b_launch = Button(self.fig.add_axes([0.78, 0.15, 0.15, 0.07]), "Launch")
+        self.b_reset = Button(self.fig.add_axes([0.78, 0.06, 0.15, 0.07]), "Reset")
+        self.b_launch.on_clicked(self._launch)
+        self.b_reset.on_clicked(self._reset)
+
+    # ---- state ----------------------------------------------------------- #
+    def _params(self):
+        return self.s_angle.val, self.s_speed.val, self.s_height.val
+
+    def _refresh(self):
+        """Recompute everything that depends on the sliders and redraw the static parts."""
+        angle, speed, height = self._params()
+        T = flight_time(speed, angle, height)
+        R = projectile_range(speed, angle, height)
+        H = max_height(speed, angle, height)
+        self.T = T
+
+        ts = np.linspace(0, T, 200)
+        xs, ys = position(ts, speed, angle, height)
+        self.path_line.set_data(xs, ys)
+        self.apex_marker.set_data([apex_x(speed, angle)], [H])
+        self.land_marker.set_data([R], [0])
+
+        # axis limits with a margin so the whole shot is always visible
+        xmax = max(R * 1.1, 5.0)
+        ymax = max(H * 1.25, 5.0)
+        self.ax.set_xlim(-0.03 * xmax, xmax)
+        self.ax.set_ylim(-0.08 * ymax, ymax)
+        if self.ground is not None:
+            self.ground.remove()
+        self.ground = self.ax.axhspan(-0.08 * ymax, 0, color="tab:brown", alpha=0.35, zorder=0)
+
+        self._place_ball(0.0)
+        self.readout.set_text(self._readout_text(R, H, T, live=None))
+        self.fig.canvas.draw_idle()
+
+    def _readout_text(self, R, H, T, live):
+        lines = [
+            f"Range        {R:7.2f} m",
+            f"Max height   {H:7.2f} m",
+            f"Flight time  {T:7.2f} s",
+        ]
+        if live is not None:
+            t, x, y = live
+            lines += ["-" * 22, f"t = {t:5.2f} s", f"x = {x:6.2f} m", f"y = {y:6.2f} m"]
+        return "\n".join(lines)
+
+    def _place_ball(self, t):
+        angle, speed, height = self._params()
+        x, y = position(t, speed, angle, height)
+        self.ball.set_data([x], [y])
+        ts = np.linspace(0, t, max(2, int(t / 0.02) + 2))
+        tx, ty = position(ts, speed, angle, height)
+        self.trail_line.set_data(tx, ty)
+        return x, y
+
+    # ---- callbacks ------------------------------------------------------- #
+    def _on_slider(self, _val):
+        self.running = False
+        self.t = 0.0
+        self._refresh()
+
+    def _launch(self, _event):
+        self.t = 0.0
+        self.running = True
+
+    def _reset(self, _event):
+        self.running = False
+        self.t = 0.0
+        for s in (self.s_angle, self.s_speed, self.s_height):
+            s.reset()
+
+    def _tick(self, _frame):
+        if not self.running:
+            return
+        self.t += FRAME_MS / 1000.0
+        if self.t >= self.T:
+            self.t = self.T
+            self.running = False
+        angle, speed, height = self._params()
+        x, y = self._place_ball(self.t)
+        R = projectile_range(speed, angle, height)
+        H = max_height(speed, angle, height)
+        self.readout.set_text(self._readout_text(R, H, self.T, live=(self.t, x, max(y, 0.0))))
+        self.fig.canvas.draw_idle()
+
+    def show(self):
+        plt.show()
+
+
+if __name__ == "__main__":
+    Simulator().show()
